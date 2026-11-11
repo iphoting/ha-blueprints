@@ -14,7 +14,10 @@ blueprint:
     group is in cool (coil-dry fan_only, dry and off are never touched), only
     when the target differs by at least 1 C, never changes hvac mode, and logs
     each write to the logbook as Adaptive Setpoint on the climate entity.
-    Outdoor-driven changes are picked up by the 15-min run.
+    Outdoor-driven changes are picked up by the 15-min run. If an outdoor
+    reference sensor is set, the lower of the local and reference readings is
+    used (a reference not reported within the maximum age is ignored), which
+    removes warm bias from a local sensor near AC condensers.
   domain: automation
   author: Ronald Ip
   source_url: https://github.com/iphoting/ha-blueprints/blob/main/blueprints/automation/iphoting/adaptive_setpoint.yaml
@@ -62,6 +65,17 @@ blueprint:
             entity:
               domain: sensor
               device_class: temperature
+        outdoor_reference_sensor:
+          name: Outdoor reference sensor (optional)
+          description: >-
+            Independent outdoor temperature (e.g. a weather or air-quality
+            station). The lower of this and the local reading is used. Leave
+            empty to use the local reading only.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
     tuning:
       name: Tuning
       icon: mdi:tune
@@ -103,6 +117,12 @@ blueprint:
           default: 0.25
           selector:
             number: {min: 0, max: 1, step: 0.05, unit_of_measurement: "°C", mode: box}
+        reference_max_age:
+          name: Reference maximum age
+          description: Ignore the reference sensor if it has not reported within this time.
+          default: 3
+          selector:
+            number: {min: 0.5, max: 24, step: 0.5, unit_of_measurement: h, mode: box}
         humidity_on:
           name: Humidity step on at dew point
           default: 21
@@ -163,6 +183,8 @@ variables:
   fan_entity: !input fan_entity
   occupancy_sensor: !input occupancy_sensor
   outdoor_sensor: !input outdoor_sensor
+  outdoor_reference_sensor: !input outdoor_reference_sensor
+  reference_max_age: !input reference_max_age
   formula_intercept: !input formula_intercept
   formula_slope: !input formula_slope
   fallback_setpoint: !input fallback_setpoint
@@ -259,7 +281,9 @@ conditions:
 
 actions:
   - variables:
-      outdoor_raw: "{{ states(outdoor_sensor) }}"
+      outdoor_local: "{{ states(outdoor_sensor) }}"
+      outdoor_ref: >-
+        {% set s = states[outdoor_reference_sensor] if outdoor_reference_sensor else none %}{% if s is not none and is_number(s.state) and (now() - s.last_reported).total_seconds() <= (reference_max_age | float(3)) * 3600 %}{{ s.state | float }}{% endif %}
       dew_raw: "{{ states(dew_point_sensor) }}"
       current: >-
         {% set t = state_attr(climate_entity, 'temperature') %}{% set ts = state_attr(climate_entity, 'target_state') %}{% if is_number(t) %}{{ t | float }}{% elif ts is mapping and is_number(ts.get('temperature')) %}{{ ts.get('temperature') | float }}{% else %}0{% endif %}
@@ -267,6 +291,11 @@ actions:
         {% if is_state(fan_entity, 'on') %}{% set p = state_attr(fan_entity, 'percentage') | float(0) %}{{ fan_high_credit if p > fan_high_pct else (fan_low_credit if p >= fan_low_pct else 0) }}{% else %}0{% endif %}
       setback: >-
         {% set s = states[occupancy_sensor] %}{{ (enable_setback and s is not none and s.state == 'off' and (now() - s.last_changed).total_seconds() >= (setback_delay | int) * 60) | bool }}
+  - variables:
+      outdoor_raw: >-
+        {% set ns = namespace(v=[]) %}{% if is_number(outdoor_local) %}{% set ns.v = ns.v + [outdoor_local | float] %}{% endif %}{% if is_number(outdoor_ref) %}{% set ns.v = ns.v + [outdoor_ref | float] %}{% endif %}{{ (ns.v | min) if ns.v else 'unavailable' }}
+      outdoor_source: >-
+        {{ 'reference' if (is_number(outdoor_ref) and (not is_number(outdoor_local) or (outdoor_ref | float) < (outdoor_local | float))) else ('local' if is_number(outdoor_local) else 'none') }}
   - variables:
       calc: >-
         {%- macro f(o, hs, sb, fc) -%}{%- if o is none -%}{%- set b = fallback_setpoint | int -%}{%- set c = setpoint_ceiling | int -%}{%- else -%}{%- set b = ((formula_intercept + formula_slope * o) | round(0)) | int -%}{%- set c = ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}{%- endif -%}{%- set p = (setback_setpoint | int) if sb else ([[b - hs + fc, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}{{- [[p, c] | min, setpoint_floor | int] | max -}}{%- endmacro -%}
@@ -300,4 +329,4 @@ actions:
       domain: climate
       entity_id: "{{ climate_entity }}"
       message: >-
-        {%- set fp = state_attr(fan_entity, 'percentage') -%}set {{ calc.target | int }} °C (was {{ current | float(0) | round(0) | int }}) · {% if setback %}unoccupied ≥ {{ setback_delay | int }} min, setback{% else %}{% if is_number(outdoor_raw) %}outdoor {{ outdoor_raw | float | round(1) }} °C → {{ calc.base }}{% else %}outdoor unavailable → {{ calc.base }} (fallback){% endif %}{% if calc.humidity_step | int %}, humidity −1 (dew point {{ dew_raw }} °C){% endif %}{% if fan_credit | int %}, fan +{{ fan_credit }} (step {{ ((fp | float(0)) / 14.2857) | round(0) | int }}){% endif %}{% if calc.raw != calc.pre %}, limited to {{ calc.pre }} °C{% endif %}{% endif %}{% if (calc.cap | int) < (setpoint_floor | int) and (calc.pre | int) > (setpoint_floor | int) %}, held at {{ setpoint_floor | int }} °C floor (outdoor {{ outdoor_raw | float | round(1) }} °C){% elif (calc.target | int) < (calc.pre | int) %}, capped below outdoor {{ outdoor_raw | float | round(1) }} °C{% endif %} · trigger: {{ trigger.id if (trigger is defined and trigger is mapping and trigger.id is defined) else 'manual' }}
+        {%- set fp = state_attr(fan_entity, 'percentage') -%}set {{ calc.target | int }} °C (was {{ current | float(0) | round(0) | int }}) · {% if setback %}unoccupied ≥ {{ setback_delay | int }} min, setback{% else %}{% if is_number(outdoor_raw) %}outdoor {{ outdoor_raw | float | round(1) }} °C{% if outdoor_source == 'reference' %} (reference; local {{ (outdoor_local | float | round(1)) if is_number(outdoor_local) else 'unavailable' }}){% endif %} → {{ calc.base }}{% else %}outdoor unavailable → {{ calc.base }} (fallback){% endif %}{% if calc.humidity_step | int %}, humidity −1 (dew point {{ dew_raw }} °C){% endif %}{% if fan_credit | int %}, fan +{{ fan_credit }} (step {{ ((fp | float(0)) / 14.2857) | round(0) | int }}){% endif %}{% if calc.raw != calc.pre %}, limited to {{ calc.pre }} °C{% endif %}{% endif %}{% if (calc.cap | int) < (setpoint_floor | int) and (calc.pre | int) > (setpoint_floor | int) %}, held at {{ setpoint_floor | int }} °C floor (outdoor {{ outdoor_raw | float | round(1) }} °C){% elif (calc.target | int) < (calc.pre | int) %}, capped below outdoor {{ outdoor_raw | float | round(1) }} °C{% endif %} · trigger: {{ trigger.id if (trigger is defined and trigger is mapping and trigger.id is defined) else 'manual' }}
