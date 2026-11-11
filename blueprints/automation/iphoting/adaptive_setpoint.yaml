@@ -1,0 +1,303 @@
+blueprint:
+  name: Adaptive AC Setpoint (ASHRAE-derived)
+  description: >-
+    Keeps a cooling AC group's setpoint on an ASHRAE-derived adaptive target
+    (not ASHRAE 55-compliant: a 30-min outdoor moving average replaces the
+    prevailing mean). Target = round(intercept + slope x outdoor), minus 1 C
+    while the room dew point is humid (on at the upper threshold, kept between
+    the thresholds if already applied, off below the lower threshold), plus a
+    ceiling-fan credit (ASHRAE 55 elevated air speed, heuristic step mapping),
+    clamped between floor and ceiling, then capped at floor(outdoor) minus a
+    margin so it stays below outdoor (the floor wins). A deadband on the outdoor
+    input keeps the current setpoint while it lies between the targets at
+    outdoor -/+ deadband. Optional unoccupied setback. Writes only while the
+    group is in cool (coil-dry fan_only, dry and off are never touched), only
+    when the target differs by at least 1 C, never changes hvac mode, and logs
+    each write to the logbook as Adaptive Setpoint on the climate entity.
+    Outdoor-driven changes are picked up by the 15-min run.
+  domain: automation
+  author: Ronald Ip
+  source_url: https://github.com/iphoting/ha-blueprints/blob/main/blueprints/automation/iphoting/adaptive_setpoint.yaml
+  homeassistant:
+    min_version: "2026.7.0"
+  input:
+    room:
+      name: Room
+      icon: mdi:home-thermometer
+      input:
+        climate_entity:
+          name: AC group
+          description: The climate entity (CGH group) whose setpoint is managed.
+          selector:
+            entity:
+              domain: climate
+        dew_point_sensor:
+          name: Room dew point sensor
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
+        fan_entity:
+          name: Ceiling fan
+          description: Native fan entity whose speed earns the air-speed credit.
+          selector:
+            entity:
+              domain: fan
+        pause_switch:
+          name: Pause switch
+          description: The automation only acts while this is on.
+          selector:
+            entity:
+              domain: input_boolean
+        occupancy_sensor:
+          name: Occupancy sensor
+          description: Used only when the unoccupied setback is enabled.
+          selector:
+            entity:
+              domain: binary_sensor
+        outdoor_sensor:
+          name: Outdoor temperature (smoothed)
+          description: 30-min moving average of the outdoor temperature.
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
+    tuning:
+      name: Tuning
+      icon: mdi:tune
+      collapsed: true
+      input:
+        formula_intercept:
+          name: Formula intercept
+          default: 17.8
+          selector:
+            number: {min: 0, max: 30, step: 0.1, mode: box}
+        formula_slope:
+          name: Formula slope
+          default: 0.31
+          selector:
+            number: {min: 0, max: 1, step: 0.01, mode: box}
+        fallback_setpoint:
+          name: Fallback setpoint when outdoor is unavailable
+          default: 27
+          selector:
+            number: {min: 16, max: 31, step: 1, unit_of_measurement: "°C", mode: box}
+        setpoint_floor:
+          name: Setpoint floor
+          default: 25
+          selector:
+            number: {min: 16, max: 31, step: 1, unit_of_measurement: "°C", mode: box}
+        setpoint_ceiling:
+          name: Setpoint ceiling
+          default: 28
+          selector:
+            number: {min: 16, max: 31, step: 1, unit_of_measurement: "°C", mode: box}
+        outdoor_margin:
+          name: Margin below outdoor
+          description: Setpoint is at most floor(outdoor) minus this value.
+          default: 1
+          selector:
+            number: {min: 0, max: 5, step: 1, unit_of_measurement: "°C", mode: box}
+        deadband:
+          name: Outdoor deadband
+          default: 0.25
+          selector:
+            number: {min: 0, max: 1, step: 0.05, unit_of_measurement: "°C", mode: box}
+        humidity_on:
+          name: Humidity step on at dew point
+          default: 21
+          selector:
+            number: {min: 10, max: 30, step: 0.5, unit_of_measurement: "°C", mode: box}
+        humidity_off:
+          name: Humidity step off below dew point
+          default: 20
+          selector:
+            number: {min: 10, max: 30, step: 0.5, unit_of_measurement: "°C", mode: box}
+        fan_low_pct:
+          name: Fan low-credit threshold (from this %)
+          default: 30
+          selector:
+            number: {min: 0, max: 100, step: 1, unit_of_measurement: "%", mode: box}
+        fan_high_pct:
+          name: Fan high-credit threshold (above this %)
+          default: 57
+          selector:
+            number: {min: 0, max: 100, step: 1, unit_of_measurement: "%", mode: box}
+        fan_low_credit:
+          name: Fan low credit
+          default: 1
+          selector:
+            number: {min: 0, max: 3, step: 1, unit_of_measurement: "°C", mode: box}
+        fan_high_credit:
+          name: Fan high credit
+          default: 2
+          selector:
+            number: {min: 0, max: 3, step: 1, unit_of_measurement: "°C", mode: box}
+    setback:
+      name: Unoccupied setback
+      icon: mdi:home-export-outline
+      collapsed: true
+      input:
+        enable_setback:
+          name: Enable unoccupied setback
+          default: false
+          selector:
+            boolean: {}
+        setback_delay:
+          name: Unoccupied for
+          default: 15
+          selector:
+            number: {min: 1, max: 120, step: 1, unit_of_measurement: min, mode: box}
+        setback_setpoint:
+          name: Setback setpoint
+          default: 28
+          selector:
+            number: {min: 16, max: 31, step: 1, unit_of_measurement: "°C", mode: box}
+
+mode: single
+max_exceeded: silent
+
+variables:
+  climate_entity: !input climate_entity
+  dew_point_sensor: !input dew_point_sensor
+  fan_entity: !input fan_entity
+  occupancy_sensor: !input occupancy_sensor
+  outdoor_sensor: !input outdoor_sensor
+  formula_intercept: !input formula_intercept
+  formula_slope: !input formula_slope
+  fallback_setpoint: !input fallback_setpoint
+  setpoint_floor: !input setpoint_floor
+  setpoint_ceiling: !input setpoint_ceiling
+  outdoor_margin: !input outdoor_margin
+  deadband: !input deadband
+  humidity_on: !input humidity_on
+  humidity_off: !input humidity_off
+  fan_low_pct: !input fan_low_pct
+  fan_high_pct: !input fan_high_pct
+  fan_low_credit: !input fan_low_credit
+  fan_high_credit: !input fan_high_credit
+  enable_setback: !input enable_setback
+  setback_delay: !input setback_delay
+  setback_setpoint: !input setback_setpoint
+
+triggers:
+  - trigger: time_pattern
+    id: periodic
+    minutes: /15
+  - trigger: homeassistant
+    id: ha_start
+    event: start
+  - trigger: state
+    id: hvac_mode_change
+    entity_id: !input climate_entity
+    not_from: [unavailable, unknown]
+    to: null
+  - trigger: state
+    id: enabled
+    entity_id: !input pause_switch
+    to: "on"
+  - trigger: temperature.crossed_threshold
+    id: dew_point_above_on
+    target:
+      entity_id: !input dew_point_sensor
+    options:
+      behavior: each
+      threshold:
+        type: above
+        value:
+          active_choice: number
+          number: !input humidity_on
+          unit_of_measurement: "°C"
+  - trigger: temperature.crossed_threshold
+    id: dew_point_below_off
+    target:
+      entity_id: !input dew_point_sensor
+    options:
+      behavior: each
+      threshold:
+        type: below
+        value:
+          active_choice: number
+          number: !input humidity_off
+          unit_of_measurement: "°C"
+  - trigger: state
+    id: fan_on_off
+    entity_id: !input fan_entity
+    not_from: [unavailable, unknown]
+    to: null
+  - trigger: state
+    id: fan_speed
+    entity_id: !input fan_entity
+    attribute: percentage
+    for: "00:02:00"
+  - trigger: occupancy.cleared
+    id: unoccupied_delay
+    enabled: !input enable_setback
+    target:
+      entity_id: !input occupancy_sensor
+    options:
+      behavior: each
+      for:
+        minutes: !input setback_delay
+  - trigger: occupancy.detected
+    id: occupied
+    enabled: !input enable_setback
+    target:
+      entity_id: !input occupancy_sensor
+    options:
+      behavior: each
+
+conditions:
+  - condition: state
+    entity_id: !input pause_switch
+    state: "on"
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: !input climate_entity
+        state: [unavailable, unknown]
+
+actions:
+  - variables:
+      outdoor_raw: "{{ states(outdoor_sensor) }}"
+      dew_raw: "{{ states(dew_point_sensor) }}"
+      current: >-
+        {% set t = state_attr(climate_entity, 'temperature') %}{% set ts = state_attr(climate_entity, 'target_state') %}{% if is_number(t) %}{{ t | float }}{% elif ts is mapping and is_number(ts.get('temperature')) %}{{ ts.get('temperature') | float }}{% else %}0{% endif %}
+      fan_credit: >-
+        {% if is_state(fan_entity, 'on') %}{% set p = state_attr(fan_entity, 'percentage') | float(0) %}{{ fan_high_credit if p > fan_high_pct else (fan_low_credit if p >= fan_low_pct else 0) }}{% else %}0{% endif %}
+      setback: >-
+        {% set s = states[occupancy_sensor] %}{{ (enable_setback and s is not none and s.state == 'off' and (now() - s.last_changed).total_seconds() >= (setback_delay | int) * 60) | bool }}
+  - variables:
+      calc: >-
+        {%- macro f(o, hs, sb, fc) -%}{%- if o is none -%}{%- set b = fallback_setpoint | int -%}{%- set c = setpoint_ceiling | int -%}{%- else -%}{%- set b = ((formula_intercept + formula_slope * o) | round(0)) | int -%}{%- set c = ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}{%- endif -%}{%- set p = (setback_setpoint | int) if sb else ([[b - hs + fc, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}{{- [[p, c] | min, setpoint_floor | int] | max -}}{%- endmacro -%}
+        {%- set o = (outdoor_raw | float) if is_number(outdoor_raw) else none -%}
+        {%- set dp = (dew_raw | float) if is_number(dew_raw) else none -%}
+        {%- set fc = fan_credit | int -%}
+        {%- set cur = current | float(0) | round(0) | int -%}
+        {%- set w = f(o, 1, false, fc) | int -%}
+        {%- set hs = 0 if dp is none else (1 if dp >= humidity_on else (1 if (dp >= humidity_off and cur == w) else 0)) -%}
+        {%- set mid = f(o, hs, setback, fc) | int -%}
+        {%- set lo = mid if o is none else f(o - deadband, hs, setback, fc) | int -%}
+        {%- set hi = mid if o is none else f(o + deadband, hs, setback, fc) | int -%}
+        {%- set base = (fallback_setpoint | int) if o is none else ((formula_intercept + formula_slope * o) | round(0)) | int -%}
+        {%- set cap = (setpoint_ceiling | int) if o is none else ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}
+        {%- set raw = base - hs + fc -%}
+        {%- set pre = (setback_setpoint | int) if setback else ([[raw, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}
+        {{ {'target': (cur if (lo <= cur <= hi) else mid), 'mid': mid, 'lo': lo, 'hi': hi, 'humidity_step': hs, 'base': base, 'cap': cap, 'raw': raw, 'pre': pre} }}
+  - condition: state
+    entity_id: !input climate_entity
+    state: cool
+  - condition: template
+    value_template: "{{ ((calc.target | float(0)) - (current | float(0))) | abs >= 1 }}"
+  - action: climate.set_temperature
+    target:
+      entity_id: !input climate_entity
+    data:
+      temperature: "{{ calc.target | int }}"
+  - action: logbook.log
+    data:
+      name: Adaptive Setpoint
+      domain: climate
+      entity_id: "{{ climate_entity }}"
+      message: >-
+        {%- set fp = state_attr(fan_entity, 'percentage') -%}set {{ calc.target | int }} °C (was {{ current | float(0) | round(0) | int }}) · {% if setback %}unoccupied ≥ {{ setback_delay | int }} min, setback{% else %}{% if is_number(outdoor_raw) %}outdoor {{ outdoor_raw | float | round(1) }} °C → {{ calc.base }}{% else %}outdoor unavailable → {{ calc.base }} (fallback){% endif %}{% if calc.humidity_step | int %}, humidity −1 (dew point {{ dew_raw }} °C){% endif %}{% if fan_credit | int %}, fan +{{ fan_credit }} (step {{ ((fp | float(0)) / 14.2857) | round(0) | int }}){% endif %}{% if calc.raw != calc.pre %}, limited to {{ calc.pre }} °C{% endif %}{% endif %}{% if (calc.cap | int) < (setpoint_floor | int) and (calc.pre | int) > (setpoint_floor | int) %}, held at {{ setpoint_floor | int }} °C floor (outdoor {{ outdoor_raw | float | round(1) }} °C){% elif (calc.target | int) < (calc.pre | int) %}, capped below outdoor {{ outdoor_raw | float | round(1) }} °C{% endif %} · trigger: {{ trigger.id if (trigger is defined and trigger is mapping and trigger.id is defined) else 'manual' }}
