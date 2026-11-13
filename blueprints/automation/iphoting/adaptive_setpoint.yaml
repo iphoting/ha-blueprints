@@ -21,6 +21,9 @@ blueprint:
     be a sensor or a weather entity (its temperature attribute), with an
     optional fallback reference used only when the primary is stale or
     unavailable. The setback can optionally be exempted from the outdoor cap.
+    An optional guest-mode switch, while on, replaces the formula intercept,
+    can suppress the setback and caps the fan credit, so guests get the neutral
+    target without energy-saving relaxations.
   domain: automation
   author: Ronald Ip
   source_url: https://github.com/iphoting/ha-blueprints/blob/main/blueprints/automation/iphoting/adaptive_setpoint.yaml
@@ -199,9 +202,42 @@ blueprint:
           default: true
           selector:
             boolean: {}
+    guest:
+      name: Guest mode
+      icon: mdi:account-multiple
+      collapsed: true
+      input:
+        guest_switch:
+          name: Guest mode switch (optional)
+          description: >-
+            While this input_boolean is on, the guest settings below apply.
+            Leave empty to disable guest mode for this room.
+          default: ""
+          selector:
+            entity:
+              domain: input_boolean
+        guest_intercept:
+          name: Formula intercept in guest mode
+          description: Replaces the formula intercept while guest mode is on (17.8 is the ASHRAE neutral value).
+          default: 17.8
+          selector:
+            number: {min: 0, max: 30, step: 0.1, mode: box}
+        guest_disable_setback:
+          name: Disable setback in guest mode
+          default: true
+          selector:
+            boolean: {}
+        guest_fan_credit_max:
+          name: Maximum fan credit in guest mode
+          default: 0
+          selector:
+            number: {min: 0, max: 3, step: 1, unit_of_measurement: "°C", mode: box}
 
 mode: single
 max_exceeded: silent
+
+trigger_variables:
+  guest_switch_entity: !input guest_switch
 
 variables:
   climate_entity: !input climate_entity
@@ -229,6 +265,10 @@ variables:
   setback_delay: !input setback_delay
   setback_setpoint: !input setback_setpoint
   setback_outdoor_cap: !input setback_outdoor_cap
+  guest_switch: !input guest_switch
+  guest_intercept: !input guest_intercept
+  guest_disable_setback: !input guest_disable_setback
+  guest_fan_credit_max: !input guest_fan_credit_max
 
 triggers:
   - trigger: time_pattern
@@ -296,6 +336,12 @@ triggers:
       entity_id: !input occupancy_sensor
     options:
       behavior: each
+  - trigger: template
+    id: guest_on
+    value_template: "{{ guest_switch_entity != '' and is_state(guest_switch_entity, 'on') }}"
+  - trigger: template
+    id: guest_off
+    value_template: "{{ guest_switch_entity != '' and is_state(guest_switch_entity, 'off') }}"
 
 conditions:
   - condition: state
@@ -309,6 +355,9 @@ conditions:
 
 actions:
   - variables:
+      guest_active: "{{ (guest_switch != '' and is_state(guest_switch, 'on')) | bool }}"
+  - variables:
+      intercept: "{{ guest_intercept if guest_active else formula_intercept }}"
       outdoor_local: "{{ states(outdoor_sensor) }}"
       outdoor_ref: >-
         {%- macro val(e) -%}{%- set s = states[e] if e else none -%}{%- if s is not none and (now() - s.last_reported).total_seconds() <= (reference_max_age | float(3)) * 3600 -%}{%- set v = s.attributes.temperature if e.startswith('weather.') else s.state -%}{%- if is_number(v) -%}{{ v | float }}{%- endif -%}{%- endif -%}{%- endmacro -%}
@@ -317,9 +366,9 @@ actions:
       current: >-
         {% set t = state_attr(climate_entity, 'temperature') %}{% set ts = state_attr(climate_entity, 'target_state') %}{% if is_number(t) %}{{ t | float }}{% elif ts is mapping and is_number(ts.get('temperature')) %}{{ ts.get('temperature') | float }}{% else %}0{% endif %}
       fan_credit: >-
-        {% if is_state(fan_entity, 'on') %}{% set p = state_attr(fan_entity, 'percentage') | float(0) %}{{ fan_high_credit if p > fan_high_pct else (fan_low_credit if p >= fan_low_pct else 0) }}{% else %}0{% endif %}
+        {% if is_state(fan_entity, 'on') %}{% set p = state_attr(fan_entity, 'percentage') | float(0) %}{% set c = fan_high_credit if p > fan_high_pct else (fan_low_credit if p >= fan_low_pct else 0) %}{{ ([c, guest_fan_credit_max] | min) if guest_active else c }}{% else %}0{% endif %}
       setback: >-
-        {% set s = states[occupancy_sensor] %}{{ (enable_setback and s is not none and s.state == 'off' and (now() - s.last_changed).total_seconds() >= (setback_delay | int) * 60) | bool }}
+        {% set s = states[occupancy_sensor] %}{{ (enable_setback and not (guest_active and guest_disable_setback) and s is not none and s.state == 'off' and (now() - s.last_changed).total_seconds() >= (setback_delay | int) * 60) | bool }}
   - variables:
       outdoor_raw: >-
         {% set ns = namespace(v=[]) %}{% if is_number(outdoor_local) %}{% set ns.v = ns.v + [outdoor_local | float] %}{% endif %}{% if is_number(outdoor_ref) %}{% set ns.v = ns.v + [outdoor_ref | float] %}{% endif %}{{ (ns.v | min) if ns.v else 'unavailable' }}
@@ -327,7 +376,7 @@ actions:
         {{ 'reference' if (is_number(outdoor_ref) and (not is_number(outdoor_local) or (outdoor_ref | float) < (outdoor_local | float))) else ('local' if is_number(outdoor_local) else 'none') }}
   - variables:
       calc: >-
-        {%- macro f(o, hs, sb, fc) -%}{%- if o is none -%}{%- set b = fallback_setpoint | int -%}{%- set c = setpoint_ceiling | int -%}{%- else -%}{%- set b = ((formula_intercept + formula_slope * o) | round(0)) | int -%}{%- set c = ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}{%- endif -%}{%- set p = (setback_setpoint | int) if sb else ([[b - hs + fc, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}{{- ([p, setpoint_floor | int] | max) if (sb and not setback_outdoor_cap) else ([[p, c] | min, setpoint_floor | int] | max) -}}{%- endmacro -%}
+        {%- macro f(o, hs, sb, fc) -%}{%- if o is none -%}{%- set b = fallback_setpoint | int -%}{%- set c = setpoint_ceiling | int -%}{%- else -%}{%- set b = ((intercept + formula_slope * o) | round(0)) | int -%}{%- set c = ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}{%- endif -%}{%- set p = (setback_setpoint | int) if sb else ([[b - hs + fc, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}{{- ([p, setpoint_floor | int] | max) if (sb and not setback_outdoor_cap) else ([[p, c] | min, setpoint_floor | int] | max) -}}{%- endmacro -%}
         {%- set o = (outdoor_raw | float) if is_number(outdoor_raw) else none -%}
         {%- set dp = (dew_raw | float) if is_number(dew_raw) else none -%}
         {%- set fc = fan_credit | int -%}
@@ -337,7 +386,7 @@ actions:
         {%- set mid = f(o, hs, setback, fc) | int -%}
         {%- set lo = mid if o is none else f(o - deadband, hs, setback, fc) | int -%}
         {%- set hi = mid if o is none else f(o + deadband, hs, setback, fc) | int -%}
-        {%- set base = (fallback_setpoint | int) if o is none else ((formula_intercept + formula_slope * o) | round(0)) | int -%}
+        {%- set base = (fallback_setpoint | int) if o is none else ((intercept + formula_slope * o) | round(0)) | int -%}
         {%- set cap = (setpoint_ceiling | int) if o is none else ((o | round(0, 'floor')) | int) - (outdoor_margin | int) -%}
         {%- set raw = base - hs + fc -%}
         {%- set pre = (setback_setpoint | int) if setback else ([[raw, setpoint_floor | int] | max, setpoint_ceiling | int] | min) -%}
@@ -358,4 +407,4 @@ actions:
       domain: climate
       entity_id: "{{ climate_entity }}"
       message: >-
-        {%- set fp = state_attr(fan_entity, 'percentage') -%}set {{ calc.target | int }} °C (was {{ current | float(0) | round(0) | int }}) · {% if setback %}unoccupied ≥ {{ setback_delay | int }} min, setback{% else %}{% if is_number(outdoor_raw) %}outdoor {{ outdoor_raw | float | round(1) }} °C{% if outdoor_source == 'reference' %} (reference; local {{ (outdoor_local | float | round(1)) if is_number(outdoor_local) else 'unavailable' }}){% endif %} → {{ calc.base }}{% else %}outdoor unavailable → {{ calc.base }} (fallback){% endif %}{% if calc.humidity_step | int %}, humidity −1 (dew point {{ dew_raw }} °C){% endif %}{% if fan_credit | int %}, fan +{{ fan_credit }} (step {{ ((fp | float(0)) / 14.2857) | round(0) | int }}){% endif %}{% if calc.raw != calc.pre %}, limited to {{ calc.pre }} °C{% endif %}{% endif %}{% if (calc.cap | int) < (setpoint_floor | int) and (calc.pre | int) > (setpoint_floor | int) and (calc.target | int) < (calc.pre | int) %}, held at {{ setpoint_floor | int }} °C floor (outdoor {{ outdoor_raw | float | round(1) }} °C){% elif (calc.target | int) < (calc.pre | int) %}, capped below outdoor {{ outdoor_raw | float | round(1) }} °C{% endif %} · trigger: {{ trigger.id if (trigger is defined and trigger is mapping and trigger.id is defined) else 'manual' }}
+        {%- set fp = state_attr(fan_entity, 'percentage') -%}set {{ calc.target | int }} °C (was {{ current | float(0) | round(0) | int }}){% if guest_active %} · guest mode{% endif %} · {% if setback %}unoccupied ≥ {{ setback_delay | int }} min, setback{% else %}{% if is_number(outdoor_raw) %}outdoor {{ outdoor_raw | float | round(1) }} °C{% if outdoor_source == 'reference' %} (reference; local {{ (outdoor_local | float | round(1)) if is_number(outdoor_local) else 'unavailable' }}){% endif %} → {{ calc.base }}{% else %}outdoor unavailable → {{ calc.base }} (fallback){% endif %}{% if calc.humidity_step | int %}, humidity −1 (dew point {{ dew_raw }} °C){% endif %}{% if fan_credit | int %}, fan +{{ fan_credit }} (step {{ ((fp | float(0)) / 14.2857) | round(0) | int }}){% endif %}{% if calc.raw != calc.pre %}, limited to {{ calc.pre }} °C{% endif %}{% endif %}{% if (calc.cap | int) < (setpoint_floor | int) and (calc.pre | int) > (setpoint_floor | int) and (calc.target | int) < (calc.pre | int) %}, held at {{ setpoint_floor | int }} °C floor (outdoor {{ outdoor_raw | float | round(1) }} °C){% elif (calc.target | int) < (calc.pre | int) %}, capped below outdoor {{ outdoor_raw | float | round(1) }} °C{% endif %} · trigger: {{ trigger.id if (trigger is defined and trigger is mapping and trigger.id is defined) else 'manual' }}
